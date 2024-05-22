@@ -9,132 +9,123 @@ from langchain.agents.format_scratchpad.openai_tools import (
     format_to_openai_tool_messages,
 )
 from langchain.agents.output_parsers.openai_tools import OpenAIToolsAgentOutputParser
+from langchain_openai import OpenAIEmbeddings
+from langchain_pinecone import PineconeVectorStore
+from langchain.prompts.prompt import PromptTemplate
 import subprocess
-from typing import Optional
-
-ROOT_DIR = "./"
-VALID_FILE_TYPES = {"py", "txt", "md", "cpp", "c", "java", "js", "html", "css", "ts", "json"}
-
+import requests
+from typing import Optional, Dict, Any
 
 @tool
-def create_react_app_with_vite():
+def get_github_issue_details(issue_number: int) -> Dict[str, Any]:
     """
-    This function creates a new React application using Vite in the 'app' directory located in the root.
+    Fetches details of a specific issue from the 'trilogy-group/eng-maintenance' GitHub repository.
 
-    It navigates to the root directory, finds or creates the 'app' directory,
-    and uses the npm 'create vite@latest' command to scaffold a new React project
-    with Vite as the build tool and React as the template. If the process is
-    successful, it prints a success message. If any subprocess command fails,
-    it catches the CalledProcessError exception and prints an error message.
-    """
-    try:
-        # Create a new Vite project in the app directory with React template
-        subprocess.run(['npm', 'create', 'vite@latest', '.', '--template', 'react'], check=True)
-        # Print success message if project creation is successful
-        return f"Successfully created a new React app using Vite."
-    except subprocess.CalledProcessError as e:
-        # Print error message if any subprocess command fails
-        return f"An error occurred: {e}"
-    except Exception as e:
-        # Print error message if any other exception occurs
-        return f"An unexpected error occurred: {e}"
-
-
-@tool
-def create_directory(directory: str) -> str:
-    """
-    Create a new writable directory with the given directory name if it does not exist.
-    If the directory exists, it ensures the directory is writable.
-
-    Parameters:
-    directory (str): The name of the directory to create.
+    Args:
+        issue_number (int): The number of the issue.
 
     Returns:
-    str: Success or error message.
-    """
-    if ".." in directory:
-        return f"Cannot make a directory with '..' in path"
-    try:
-        os.makedirs(directory, exist_ok=True)
-        subprocess.run(["chmod", "u+w", directory], check=True)
-        return f"Directory successfully '{directory}' created and set as writeable."
-    except subprocess.CalledProcessError as e:
-        return f"Failed to create or set writable directory '{directory}': {e}"
-    except Exception as e:
-        return f"An unexpected error occurred: {e}"
+        dict: A dictionary containing issue details.
 
+    Raises:
+        requests.exceptions.RequestException: If the request fails for any reason.
+    """
+    owner = "trilogy-group"
+    repo = "eng-maintenance"
+    url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}"
+    headers = {}
+
+    headers['Accept'] = 'application/vnd.github+json'
+    access_token = os.environ.get('GITHUB_TOKEN')
+    if access_token:
+        headers['Authorization'] = f'token {access_token}'
+    else:
+        raise ValueError("GITHUB_TOKEN environment variable is not set.")
+
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+    return response.json()
 
 @tool
-def find_file(filename: str, path: str) -> Optional[str]:
+def evaluate_response(question: str) -> str:
     """
-    Recursively searches for a file in the given path.
-    Returns string of full path to file, or None if file not found.
-    """
-    # TODO handle multiple matches
-    for root, dirs, files in os.walk(path):
-        if filename in files:
-            return os.path.join(root, filename)
-    return None
+    Evaluates the answer to a question.
 
+    Args:
+        question (str): The question to evaluate.
+
+    Returns:
+        str: The evaluation of the answer.
+    """
+
+    prompt = (
+        "Please review the question and generate response in markdown format (to be added as a github issue comment):\n"
+        f"{question}\n"
+    )
+
+    # Note: we must use the same embedding model that we used when uploading the docs
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+
+    # Querying the vector database for "relevant" docs
+    document_vectorstore = PineconeVectorStore(index_name="lithium-manuals", embedding=embeddings)
+    retriever = document_vectorstore.as_retriever()
+    context = retriever.get_relevant_documents(prompt)
+
+    # Adding context to our prompt
+    template = PromptTemplate(template="{query} Context: {context}", input_variables=["query", "context"])
+    prompt_with_context = template.invoke({"query": prompt, "context": context})
+
+    # Asking the LLM for a response from our prompt with the provided context
+    results = llm.invoke(prompt_with_context)
+    return results.content
 
 @tool
-def create_file(filename: str, content: str = "", directory=""):
-    """Creates a new file and content in the specified directory."""
-    # Validate file type
-    try:
-        file_stem, file_type = filename.split(".")
-        assert file_type in VALID_FILE_TYPES
-    except:
-        return f"Invalid filename {filename} - must end with a valid file type: {valid_file_types}"
-    directory_path = os.path.join(ROOT_DIR, directory)
-    file_path = os.path.join(directory_path, filename)
-    if not os.path.exists(file_path):
-        try:
-            with open(file_path, "w")as file:
-                file.write(content)
-            print(f"File '{filename}' created successfully at: '{file_path}'.")
-            return f"File '{filename}' created successfully at: '{file_path}'."
-        except Exception as e:
-            print(f"Failed to create file '{filename}' at: '{file_path}': {str(e)}")
-            return f"Failed to create file '{filename}' at: '{file_path}': {str(e)}"
-    else:
-        print(f"File '{filename}' already exists at: '{file_path}'.")
-        return f"File '{filename}' already exists at: '{file_path}'."
+def create_github_issue_comment(issue_number: int, content: str) -> str:
+    """
+    Creates a new comment on a specific issue in the 'trilogy-group/eng-maintenance' GitHub repository.
 
+    Args:
+        issue_number (int): The number of the issue.
+        content (str): The content of the comment.
 
-@tool
-def update_file(filename: str, content: str, directory: str = ""):
-    """Updates, appends, or modifies an existing file with new content."""
-    if directory:
-        file_path = os.path.join(ROOT_DIR, directory, filename)
-    else:
-        file_path = find_file(filename, ROOT_DIR)
+    Returns:
+        str: A success or error message.
+    """
+    owner = "trilogy-group"
+    repo = "eng-maintenance"
+    url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/comments"
+    headers = {}
 
-    if file_path and os.path.exists(file_path):
-        try:
-            with open(file_path, "a") as file:
-                file.write(content)
-            return f"File '{filename}' updated successfully at: '{file_path}'"
-        except Exception as e:
-            return f"Failed to update file '{filename}' at: '{file_path}' - {str(e)}"
+    headers['Accept'] = 'application/vnd.github.v3+json'
+    access_token = os.environ.get('GITHUB_TOKEN')
+    if access_token:
+        headers['Authorization'] = f'token {access_token}'
     else:
-        return f"File '{filename}' not found at: '{file_path}'"
+        return "GITHUB_TOKEN environment variable is not set."
+
+    contentStarting = "This is a comment from a development AI agent:"
+    content = contentStarting + "\n" + content
+    data = {"body": content}
+    response = requests.post(url, headers=headers, json=data)
+    if response.status_code == 201:
+        return "Comment created successfully."
+    else:
+        return f"Failed to create comment. Status code: {response.status_code}"
+
 
 
 # List of tools to use
 tools = [
     ShellTool(ask_human_input=True),
-    create_directory,
-    create_react_app_with_vite,
-    find_file,
-    create_file,
-    update_file
+    get_github_issue_details,
+    evaluate_response,
+    create_github_issue_comment,
     # Add more tools if needed
 ]
 
 
 # Configure the language model
-llm = ChatOpenAI(model="gpt-4o", temperature=0)
+llm = ChatOpenAI(model="gpt-4o-2024-05-13", temperature=0)
 
 
 # Set up the prompt template
@@ -142,7 +133,7 @@ prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "You are an expert web developer.",
+            "You are an expert chatbot that can answer technical queries. You grab the github issue and filter out the question from it. You then evaluate the answer and post the answer in a comment in the same issue.",
         ),
         ("user", "{input}"),
         MessagesPlaceholder(variable_name="agent_scratchpad"),
